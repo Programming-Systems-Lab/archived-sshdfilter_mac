@@ -1,0 +1,1231 @@
+#!/usr/bin/perl
+
+use strict 'vars';
+use Socket;
+
+
+# sshdfilter   
+# greg at csc.liv.ac.uk
+# http://www.csc.liv.ac.uk/~greg/sshdfilter/
+my $version="1.5.4";
+
+# Description:
+# Picks out sshd log lines such as:
+#   Did not receive identification string from 217.147.176.135
+#   Illegal user ouoeuoeu from 192.168.9.24
+#   Failed password for {illegal,invalid} user oouoeu from 192.168.7.1 port 33562 ssh2
+#   Failed password for peter from 192.168.7.1 port 33570 ssh2
+# Depending on the action patterns supplied in the configuration file, these messages will
+# lead to an instant block, a block after some failures, or no block at all.
+
+# Looking through old logs, the longest attack from a single IP was 30 mins.
+# So the default block times could be reduced.
+
+my $conffile="/etc/sshdfilterrc";
+if( exists $ENV{"SSHDFILTERRC"} ) {
+   $conffile=$ENV{"SSHDFILTERRC"};
+}
+
+open(CONF,$conffile) || die "No config file $conffile\n";
+
+
+# no longer used, del when it really is no longer used
+
+my $maxblocktime=3600*24*3;   # how long (seconds) after the last activity from an ip that it can be unblocked
+my $maxchances=3;   # how many password guesses of an existing user before going on the blocked list
+                      # beware, sshd -e -D can report events in double, so this value needs to be twice what it shoud be
+    
+# All these options are overwritten by config file 
+    
+my $chain="SSHD";   # name of sshdfilter chain, just incase you want to run multiple isolated sshdfilters
+
+# firewall commands to execute. They have available: 
+# $ip - IP address of the offending machine.
+# $chain - Chain to add this IP to.
+# $idx - the next free ipfw index number (if you are using ipfw).
+my $firewalladd="";     # add DROP rule
+my $firewalldel="";     # delete DROP rule
+
+my $fwcmdpath="";      # path to iptables, iptables6 or ipfw. Not normally needed.
+
+my $iptables="iptables";   # iptables or iptables6  (ipfw mode assumes the ipfw command)
+
+my $iptablesoptions;   # obsolete. If this is set to anything, config file is for < 1.5.4
+
+my $sshdpath="/usr/sbin/sshd";   # where sshd lives
+my $sshdname="sshd";  # the name of the sshd process, only needed to identify the sshd processes
+                                 # from a none STDIN logsource.
+my $logpid=0;              # parent pid of any pids reported in syslog, so we can identify our sshd processes
+
+my $ip6toip4=1;               # should IPv6 addresses (which are really IPv4 addresses) be converted to IPv4?
+
+my $debug=1;   # !0 means debug mode, more info is logged, namely the pattern matches.
+
+my $sanitise="[^-a-zA-Z0-9_]";  # remove everything but these chars from the username (^ means not)
+
+my $logsource="STDIN"; # where sshd logs come from, sshd -e -D | sshdfilter style, or via a
+                       # named pipe setup in syslog.conf
+
+my $ipfwmin=-1;   # if >=0, ipfw will be used instead of iptables
+my $ipfwmax=-1;
+
+# **** Shouldn't need to change anything after this line
+
+use IO::Handle;
+use Sys::Syslog  qw(:DEFAULT setlogsock);
+use POSIX 'setsid';
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use POSIX ":sys_wait_h";
+use Socket;    # for name lookups, some PAM messages use the FQDN instead of the IP
+
+
+# sshd log messages
+my @txt_pid2ip;
+my @txt_pidexit;
+my @txt_invalid;
+my @txt_failval;
+my @txt_accept;
+my @txt_noid;
+my @txt_quit;
+
+my @map_pid2ip;
+my @map_pidexit;
+my @map_invalid;
+my @map_failval;
+my @map_accept;
+my @map_noid;
+my @map_quit;
+
+# user policy, max counter, block time, and corresponding regular expression
+my @maxc;
+my @btime;
+my @userre;
+my %maxc_tags;   # INVALID, NOID, DIRTY
+my %btime_tags;
+
+foreach my $i (INVALID, NOID, DIRTY, DEFAULT) {
+   $btime_tags{$i}=$maxblocktime;
+   $maxc_tags{$i}=$maxchances;
+ }
+
+# Regexs matching IP addresses
+my @ipre;
+my @ipaction;
+
+# Email block events policy
+my @mailre;
+my @mailaction={ 0 };
+my $mail;   # mail command line
+
+# config parser counters
+my $line=0;
+my $polline=0;
+
+my $confstate="";
+
+my $parse_maxc=$maxchances;
+my $parse_btime=$maxblocktime;
+
+while(<CONF>)
+ {
+   $line++;
+   chomp;
+   s/ #.*//g;
+   if( /^+s*#/ || /^\s*$/ ) {
+   } elsif( /^SECTION (.*)/ ) {
+     $confstate=$1;
+     $polline=0;
+     #printf "Setting Conf $_, to $confstate\n";
+     if ( $confstate eq "EMAILPOLICY" ){ $polline=1; }
+
+   } elsif ( $confstate eq "SSHDLOG" ){
+
+      if( /^\s*(.*)\s*=\s*'(.*)'/ ) {
+         my $key=$1; my $pat=$2;
+         #print "extracted >$key<, >$pat<\n";
+         if   ( $key eq "msg_pid_2_ip" ) { push @txt_pid2ip, $pat; }
+         elsif( $key eq "map_pid_2_ip" ) { push @map_pid2ip, $pat; }
+         elsif( $key eq "msg_pid_exit" ) { push @txt_pidexit, $pat; }
+         elsif( $key eq "map_pid_exit" ) { push @map_pidexit, $pat; }
+         elsif( $key eq "msg_invalid" ) { push @txt_invalid, $pat; }
+         elsif( $key eq "map_invalid" ) { push @map_invalid, $pat; }
+         elsif( $key eq "msg_failed_valid" ) { push @txt_failval,$pat; }
+         elsif( $key eq "map_failed_valid" ) { push @map_failval,$pat; }
+         elsif( $key eq "msg_accepted_user" ) { push @txt_accept,$pat; }
+         elsif( $key eq "map_accepted_user" ) { push @map_accept,$pat; }
+         elsif( $key eq "msg_no_id_string"   ) { push @txt_noid,$pat; }
+         elsif( $key eq "map_no_id_string"   ) { push @map_noid,$pat; }
+         elsif( $key eq "msg_quit"   ) { push @txt_quit,$pat; }
+         elsif( $key eq "map_quit"   ) { push @map_quit,$pat; }
+         else { print "Line $line, unknown keyword $key\n"; }
+      } else {
+         print "Ignoring line $line: %s\n",$_;
+      }
+
+   } elsif( $confstate eq "USERPOLICY" ){   # USERPOLICY section
+
+      my $ismatch=0;
+      my $mcount="";  my $t="";  my $tunits="";  my $re="";
+      #print "Considering $_\n";
+      if( /^\s*([0-9]+)\s*=\s*((?:DEFAULT|NOID|INVALID|DIRTY|'.+'))/) {
+         $ismatch=1;
+         #print "mcount=$1, userre=$2\n";
+         $mcount=$1;  $re=$2;
+       } elsif( /^\s*([0-9]*)\s*,\s*([0-9]*)\s*([dhms]?)\s*=\s*((?:DEFAULT|NOID|INVALID|DIRTY|'.+'))/ ) {
+         $ismatch=1;
+         #print "mcount=$1, t=$2, tunits=$3, userre=$4\n";
+         $mcount=$1;  $t=$2;  $tunits=$3;  $re=$4;
+      }
+      if( $ismatch ){
+         #$re =~ s/^'//;   $re =~ s/'$//;
+         $re =~ s/^'(.*)'$/$1/;
+         if( $mcount =~ /[0-9]/ ) { $maxc[$polline]=$mcount; } else { $maxc[$polline]=$parse_maxc; }
+         if( $t =~ /[0-9]/ ){
+            $btime[$polline]=$t;
+            if( $tunits eq "d" ){ $btime[$polline]*=3600*24; } 
+            if( $tunits eq "h" ){ $btime[$polline]*=3600; } 
+            if( $tunits eq "m" ){ $btime[$polline]*=60; } 
+            if( $tunits eq "s" ){ } 
+            if( $btime[$polline] < 5 ){ print "Warning, short block time of $btime[$polline] seconds. "; print "Line $line: $_\n"; }
+         } else { $btime[$polline]=$parse_btime; }
+         if( $re =~ /^.+$/ ) { 
+            $userre[$polline]=$re;
+         } else {
+            print "Warning, parser broke, line $line, $_\n$re\n";
+            delete $btime[$polline];   delete $maxc[$polline];  delete $userre[$polline];
+            $polline--;
+         }
+
+         # deal with NOID|INVALID|DIRTY and DEFAULTs effect on them
+         if( $re eq "DEFAULT" ) {
+            if( $mcount =~ /[0-9]/ ) { $parse_maxc=$maxc[$polline]; }
+            if(  $t =~ /[0-9]/ ){ $parse_btime=$btime[$polline]; }
+          } elsif( $re eq "NOID" || $re eq "INVALID" || $re eq "DIRTY" ) {
+            if(  $mcount =~ /[0-9]/ ) { $maxc_tags{$re}=$maxc[$polline]; } else { $maxc_tags{$re}=$parse_maxc; }
+            if(  $t =~ /[0-9]/ ){ $btime_tags{$re}=$btime[$polline]; } else { $btime_tags{$re}=$parse_btime; }
+            if( $re eq "NOID" || $re eq "DIRTY" ) {
+               delete $btime[$polline];   delete $maxc[$polline];  delete $userre[$polline];
+               $polline--;
+             }
+          }
+         $polline++;
+        
+      } else {
+         print "USERPOLICY section, bad syntax, line $line: $_\n";
+      }
+
+   } elsif( $confstate eq "IPPOLICY" ){
+
+     if( /^([\+\-])'(.*)'/ ) {
+         push @ipre,$2;
+         #print "Adding to whitelist $1, $2\n";
+         if( $1 eq "+" ) { push @ipaction,0; }
+         if( $1 eq "-" ) { push @ipaction,1; }
+     } else {
+       printf "Bad syntax, line $line: %s\n",$_; }
+
+   } elsif( $confstate eq "EMAILPOLICY" ){
+
+     if( /^([\+\-])((?:DEFAULT|DIRTY|INVALID|NOID|'.+'))/ ) {
+         my $pos=$#mailaction+1;
+         my $yy=$1;  my $re=$2;
+         $re =~ s/^'(.*)'$/$1/;
+         if( $re eq "DEFAULT" ) { $pos=0; }
+         if( $yy eq "+" ){ $mailaction[$pos]=1; } else { $mailaction[$pos]=0; }
+         $mailre[$pos]=$re;
+     } else {
+       printf "Bad syntax, line $line: %s\n",$_; }
+
+   } elsif( $confstate eq "OPTIONS" ){
+
+     if(    /^sanitise\s*=\s*'(.*)'/ ) { $sanitise=$1; }
+     elsif( /^maxblocktime\s*=\s*(.*)/ ) { $maxblocktime=eval $1; }
+     elsif( /^maxchances\s*=\s*(.*)/ ) { $maxchances=eval $1; }
+     elsif( /^firewalladd\s*=\s*'(.*)'/ ) { $firewalladd=$1; }
+     elsif( /^firewalldel\s*=\s*'(.*)'/ ) { $firewalldel=$1; }
+     elsif( /^fwcmdpath\s*=\s*'(.*)'/ ) { $fwcmdpath="$1/"; }
+     elsif( /^ipfwmin\s*=\s*([0-9]+)/ ) { $ipfwmin=$1; }
+     elsif( /^ipfwmax\s*=\s*([0-9]+)/ ) { $ipfwmax=$1; }
+     elsif( /^iptablesoptions\s*=\s*'(.*)'/ ) { $iptablesoptions=$1; }
+     elsif( /^chain\s*=\s*'([^ ]*)'/ ) { $chain=$1; }
+     elsif( /^mail\s*=\s*'(.*)'/ ) { $mail=$1; }
+     elsif( /^ip6toip4\s*=\s*([01])/ ) { $ip6toip4=$1; }
+     elsif( /^logsource\s*=\s*'([^ ]*)'/ ) { $logsource=$1; }
+     elsif( /^sshdpath\s*=\s*'([^ ]*)'/ ) { $sshdpath=$1; }
+     elsif( /^sshdname\s*=\s*'(.*)'/ ) { $sshdname=$1; }
+     elsif( /^logpid\s*=\s*(.*)/ ) { $logpid=$1; }
+     elsif( /^debug\s*=\s*([0123])/ ) { $debug=$1; }
+     else { print "Unknown option line $line: $_\n"; }
+
+   } else { printf "Ignoring line $line: %s\n",$_; }
+ } # For each line in the configuration file
+
+close CONF;
+
+
+# apply some extra option logic
+if( $ip6toip4 == 0 ) {
+   $iptables="ip6tables";
+ }
+    
+
+# read in ARGV if needed, lets the caller pass a pid value (well, really a parent pid)
+if( $logsource ne "STDIN" ) {
+   for(my $idx=0; $idx<=$#ARGV; $idx++) {
+       if( $ARGV[$idx] =~ /logpid\s*=\s*(.*)/ ) { $logpid=$1; }
+    }
+ }
+
+if( $firewalladd eq "" ) { print "no firewalladd command defined\n"; exit 1; }
+if( $firewalldel eq "" ) { print "no firewalldel command defined\n"; exit 1; }
+
+if( $ipfwmin!=-1 && $ipfwmin>=$ipfwmax ) { print "ipfwmin greater than ipfwmax\n"; exit 1; }
+if( $ipfwmin!=-1 && $ipfwmin>65535 ) { print "ipfwmin greater than allowed by ipfw\n"; exit 1; }
+if( $ipfwmin!=-1 && $ipfwmax>65535 ) { print "ipfwmax greater than allowed by ipfw\n"; exit 1; }
+if( $ipfwmin==-1 && $ipfwmax!=-1 ) { print "ipfwmax defined, but ipfwmin still undefined\n"; exit 1; }
+
+#if( $#txt_pid2ip ==-1 ) { print "msg_pid_2_ip undefined\n"; exit 1; }
+#if( $#map_pid2ip ==-1 ) { print "map_pid_2_ip undefined\n"; exit 1; }
+#if( $#txt_pidexit ==-1 ) { print "msg_pid_exit undefined\n"; exit 1; }
+#if( $#map_pidexit ==-1 ) { print "map_pid_exit undefined\n"; exit 1; }
+if( $#txt_invalid ==-1 ) { print "msg_invalid undefined\n"; exit 1; }
+if( $#map_invalid ==-1 ) { print "map_invalid undefined\n"; exit 1; }
+if( $#txt_failval ==-1 ) { print "msg_failed_valid undefined\n"; exit 1; }
+if( $#map_failval ==-1 ) { print "map_failed_valid undefined\n"; exit 1; }
+if( $#txt_accept ==-1 ) { print "msg_accepted_user undefined\n"; exit 1; }
+if( $#map_accept ==-1 ) { print "map_accepted_user undefined\n"; exit 1; }
+if( $#txt_noid ==-1 ) { print "msg_no_id_string undefined\n"; exit 1; }
+if( $#map_noid ==-1 ) { print "map_no_id_string undefined\n"; exit 1; }
+if( $#txt_quit ==-1 ) { print "msg_quit undefined\n"; exit 1; }
+if( $#map_quit ==-1 ) { print "map_quit undefined\n"; exit 1; }
+
+if( $#txt_pid2ip != $#map_pid2ip ) { print "#msg_pid_2_ip != #map_pid_2_ip, $#txt_pid2ip != $#map_pid2ip\n"; exit 1; }
+if( $#txt_pidexit != $#map_pidexit ) { print "#msg_pid_exit != #map_pid_exit, $#txt_pidexit != $#map_pidexit\n"; exit 1; }
+if( $#txt_invalid != $#map_invalid ) { print "#msg_invalid != #map_invalid, $#txt_invalid != $#map_invalid\n"; exit 1; }
+if( $#txt_failval != $#map_failval ) { print "#msg_failed_valid != #map_failed_valid, $#txt_failval != $#map_failval\n"; exit 1; }
+if( $#txt_accept != $#map_accept ) { print "#msg_accepted_user != #map_accepted_user, $#txt_accept != $#map_accept\n"; exit 1; }
+if( $#txt_noid != $#map_noid ) { print "#msg_no_id_string != #map_no_id_string, $#txt_noid != $#map_noid\n"; exit 1; }
+if( $#txt_quit != $#map_quit ) { print "#msg_quit != #map_quit, $#txt_quit != $#map_quit\n"; exit 1; }
+
+foreach my $i ("DEFAULT", "NOID", "DIRTY", "INVALID") {
+   if( ! defined $maxc_tags{$i} ) { $maxc_tags{$i}=$maxc_tags{"DEFAULT"}; }
+   if( ! defined $btime_tags{$i} ) { $btime_tags{$i}=$btime_tags{"DEFAULT"}; }
+ }
+
+
+
+# Daemonise like sshd, better fits regular startup scripts. Function nicked from perlipc3 man page
+# Have the parent wait until the other deamons have started before letting the original parent quit
+pipe(CONSOLEPROC_RDR,  CONSOLEPROC);
+CONSOLEPROC->autoflush(1);
+
+chdir '/'               or die "Can't chdir to /: $!";
+open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+open STDOUT, '>/dev/null' or die "Can't write to /dev/null: $!";
+
+my $daemonpid=0;
+defined($daemonpid = fork) or die "Can't fork: $!";
+if ($daemonpid>0) {  # wait on handle for some sign until all the children have been created
+  close CONSOLEPROC;
+  my $res=1;
+  while(<CONSOLEPROC_RDR>){
+     if(/Exit ok!/) {
+        $res=0;
+      }
+   }
+  close CONSOLEPROC_RDR;
+}
+setsid                  or die "Can't start a new session: $!";
+open STDERR, '>&STDOUT' or die "Can't dup stdout: $!";
+
+
+
+# fork another process, just so we can have a separate instance of 
+# openlog() for sshd. Code nicked from PerlIPC man page
+my $SSHDLOGGER = IO::Handle->new();
+my $pid;
+if( $logsource eq "STDIN" ) {
+   pipe(CHILD_RDR,  $SSHDLOGGER);
+   $SSHDLOGGER->autoflush(1);
+
+   $pid=fork;
+   if ( $pid == 0 ) {   
+      close $SSHDLOGGER;
+      close CONSOLEPROC;
+
+      chdir '/'               or die "Can't chdir to /: $!";
+      open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+      open STDOUT, '>/dev/null';
+
+      # open logging specific to sshd
+      setlogsock('unix');
+      openlog 'sshd', 'pid,ndelay', 'authpriv';
+
+      while(<CHILD_RDR>) # output all received lines to this log
+       {
+         chomp;
+         syslog 'authpriv|notice',"$_";
+       }
+      closelog();
+      close CHILD_RDR;
+      exit 0;
+    }
+   die "cannot fork: $!" unless defined $pid;
+   close CHILD_RDR;
+ }
+
+
+# open logging for sshdfilter
+setlogsock('unix');
+openlog 'sshdfilt', 'pid,ndelay', 'authpriv';
+
+
+# check user has setup IP tables (or ipfw)
+
+if( $ipfwmin==-1 ){
+   # iptables -L -n | grep "^SSHD *tcp"
+   # SSHD       tcp  --  0.0.0.0/0            0.0.0.0/0          tcp dpt:22 
+   open(TABCHECK,"$iptables -L -n | grep \"^$chain *tcp\"|") || die("couldn't check $iptables");
+   my $aline=<TABCHECK>;
+   close(TABCHECK);
+   if( $aline !~ /^$chain/ ) {
+      syslog 'authpriv|warning',"$iptables is missing $chain redirect, sshdfilter rendered useless.";
+    }
+
+   # iptables -L SSHD -n | grep "Chain SSHD"
+   # Chain SSHD (1 references)
+   open(TABCHECK,"$iptables -L $chain -n | grep \"^Chain $chain\"|") || die("couldn't check $iptables");
+   $aline=<TABCHECK>;
+   close(TABCHECK);
+   if( $aline !~ /^Chain $chain/ ) {
+       syslog 'authpriv|warning',"$iptables is missing $chain chain, sshdfilter rendered useless.";
+    }
+ }
+else
+ {
+   # Don't check ipfw configuration, although I suggest a skip-these-rules rule, it isn't
+   # necessary, so the only additions could be block events as they happen.
+ }
+
+
+# run sshd
+if( $logsource eq "STDIN" ) {
+   syslog 'authpriv|notice',"sshdfilter $version starting up, running sshd proper.";
+ } else {
+   syslog 'authpriv|notice',"sshdfilter $version starting up.";
+ }
+
+# maybe log the setup
+if( $debug ) {
+   syslog 'authpriv|notice', "DB:OPTIONS";
+   syslog 'authpriv|notice',"DB: maxblocktime=$maxblocktime";
+   syslog 'authpriv|notice',"DB: maxchances=$maxchances";
+   syslog 'authpriv|notice',"DB: firewalladd=$firewalladd";
+   syslog 'authpriv|notice',"DB: firewalldel=$firewalldel";
+   syslog 'authpriv|notice',"DB: fwcmdpath=$fwcmdpath";
+   syslog 'authpriv|notice',"DB: sshdpath=$sshdpath";
+   syslog 'authpriv|notice',"DB: sshdname=$sshdname";
+   syslog 'authpriv|notice',"DB: logpid=$logpid";
+   syslog 'authpriv|notice',"DB: ip6toip4=$ip6toip4";
+   syslog 'authpriv|notice',"DB: iptables command=$iptables";
+   syslog 'authpriv|notice',"DB: iptables chain=$chain";
+   syslog 'authpriv|notice',"DB: ipfwmin=$ipfwmin";
+   syslog 'authpriv|notice',"DB: ipfwmax=$ipfwmax";
+   syslog 'authpriv|notice',"DB: debug=$debug";
+   syslog 'authpriv|notice',"DB: logsource=$logsource";
+   syslog 'authpriv|notice',"DB: sshd args=@ARGV";
+   syslog 'authpriv|notice',"DB: sanitise=$sanitise";
+   syslog 'authpriv|notice',"DB: mail=$mail";
+
+   my $p=sprintf "DB:USER POLICY entries=%d",$#userre+1;   syslog 'authpriv|notice',$p;
+   for(my $i=0;$i<=$#userre;$i++) {
+      syslog 'authpriv|notice',"DB: $i, $maxc[$i], $btime[$i], $userre[$i]";
+    }
+   foreach my $i ("DEFAULT", "NOID", "DIRTY", "INVALID") {
+      syslog 'authpriv|notice',"DB: $maxc_tags{$i}, $btime_tags{$i}, tag=$i";
+    }
+   
+
+   $p=sprintf "DB:IP POLICY entries=%d",$#ipre+1;    syslog 'authpriv|notice',$p;
+   for(my $i=0;$i<=$#ipre;$i++) {
+      syslog 'authpriv|notice',"DB: $i, action=$ipaction[$i], re=$ipre[$i]";
+    }
+
+   $p=sprintf "DB:EMAIL POLICY entries=%d",$#mailaction+1;    syslog 'authpriv|notice',$p;
+   for(my $i=0;$i<=$#mailaction;$i++) {
+      syslog 'authpriv|notice',"DB: $i, action=$mailaction[$i], re=$mailre[$i]";
+    }
+
+   my $isdefined=0;
+
+   for(my $idx=0; $idx<=$#txt_pid2ip; $idx++) 
+    { syslog 'authpriv|notice',"DB: msg_pid_2_ip[$idx]=$txt_pid2ip[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#map_pid2ip; $idx++) 
+    { syslog 'authpriv|notice',"DB: map_pid_2_ip[$idx]=$map_pid2ip[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#txt_pidexit; $idx++) 
+    { syslog 'authpriv|notice',"DB: msg_pid_exit[$idx]=$txt_pidexit[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#map_pidexit; $idx++) 
+    { syslog 'authpriv|notice',"DB: map_pid_exit[$idx]=$map_pidexit[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#txt_invalid; $idx++) 
+    { syslog 'authpriv|notice',"DB: msg_invalid[$idx]=$txt_invalid[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#map_invalid; $idx++) 
+    { syslog 'authpriv|notice',"DB: map_invalid[$idx]=$map_invalid[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#txt_failval; $idx++) 
+    { syslog 'authpriv|notice',"DB: msg_failed_valid[$idx]=$txt_failval[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#map_failval; $idx++) 
+    { syslog 'authpriv|notice',"DB: map_failed_valid[$idx]=$map_failval[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#txt_accept; $idx++) 
+    { syslog 'authpriv|notice',"DB: msg_accepted_user[$idx]=$txt_accept[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#map_accept; $idx++) 
+    { syslog 'authpriv|notice',"DB: map_accepted_user[$idx]=$map_accept[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#txt_noid; $idx++) 
+    { syslog 'authpriv|notice',"DB: msg_no_id_string[$idx]=$txt_noid[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#map_noid; $idx++) 
+    { syslog 'authpriv|notice',"DB: map_no_id_string[$idx]=$map_noid[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#txt_quit; $idx++) 
+    { syslog 'authpriv|notice',"DB: msg_quit[$idx]=$txt_quit[$idx]"; $isdefined++; }
+   for(my $idx=0; $idx<=$#map_quit; $idx++) 
+    { syslog 'authpriv|notice',"DB: map_quit[$idx]=$map_quit[$idx]"; $isdefined++; }
+
+   if( $isdefined<10 ) {
+      syslog 'authpriv|err', "SSHDLOG section of /etc/sshdfilterrc is missing $isdefined regexs";
+      syslog 'authpriv|err', "This probably means either you are using a pre 1.5 verison of the";
+      syslog 'authpriv|err', "sshdfilterrc file, which will not work, Or, you forgot to append";
+      syslog 'authpriv|err', "the appropriate pattern file from patterns/ to your /etc/sshdfilterrc.";
+    }
+ } # end of $debug flag
+
+my $SSHDHANDLE = IO::Handle->new();
+
+if( $logsource ne "STDIN" )
+ {
+   open($SSHDHANDLE,$logsource) || syslog 'authpriv|err', "Tried to open a named pipe $logsource for sshd log messages, but failed";
+ }
+else
+ {
+   # fork for sshd process. open() blocked daemonise code. fork()/exec() doesn't. 
+   # Code nicked from PerlIPC man page
+   pipe($SSHDHANDLE,  SSHDHAND_WTR);
+   SSHDHAND_WTR->autoflush(1);
+
+   my $sshdpid=fork;
+   if ( $sshdpid == 0 ) {   
+       close $SSHDHANDLE;
+       close CONSOLEPROC;
+       close $SSHDLOGGER;
+
+       chdir '/'               or die "Can't chdir to /: $!";
+       open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+       open STDOUT, ">&SSHDHAND_WTR"    or die "Can't dup SSHDHAND_WTR: $!";
+       open STDERR, ">&SSHDHAND_WTR"    or die "Can't dup SSHDHAND_WTR: $!";
+
+       exec "$sshdpath", @ARGV, "-e","-D";
+
+       syslog 'authpriv|err',"couldn't run $sshdpath";
+       die("couldn't run $sshdpath");
+
+       close SSHDHAND_WTR;
+       exit 0;
+    }
+
+   if( !defined $sshdpid ){  syslog 'authpriv|err',"cannot fork: $!";
+                             die "cannot fork: $!";
+                          }
+   close SSHDHAND_WTR;
+
+   sleep 1;
+
+   # attempt to get some better sshd status information
+   my $res=waitpid( $sshdpid, WNOHANG );
+   if( $res!=0 ) {
+      syslog 'authpriv|err',"ran sshd and waited one second, it died and said: status=$res error=$?";
+    }
+ } # If using stdin for sshd log messages, and we are running sshd ourselves
+
+# do NOT flush the ipfw. we already loaded in persistent ones!
+#if( $ipfwmin==-1 ){
+#   syslog 'authpriv|notice',"Flushing $chain chain";
+#   loggingsystem("${fwcmdpath}$iptables -F $chain");
+# } else {
+#   syslog 'authpriv|notice',"Deleting rule numbers $ipfwmin to $ipfwmax";
+#   open(RULES,"${fwcmdpath}ipfw show |") || syslog 'authpriv|err',"Couldn't flush old rules, command failed.";
+#   if( RULES ){
+#      while(<RULES>){
+#         chomp;
+#         my ($idx,$therest)=split(/\s/,$_);
+#         if( $idx>=$ipfwmin && $idx<=$ipfwmax ){
+#            loggingsystem("${fwcmdpath}ipfw delete $idx");
+#          }
+#       }
+#      close RULES;
+#    }
+# }
+
+# write a pid
+open(THISPID,">/var/run/sshdfilter.pid.$chain") || die("couldn't write pid file");
+printf THISPID "%d\n",$$;
+close(THISPID);
+
+
+# Run the given command, log any problems as an error
+sub loggingsystem {
+   my $command=shift;
+   if (system($command) != 0) {
+      my $res=$?;
+      if( $res>255 ) { $res = $res >> 8; }
+      syslog 'authpriv|err',"system(\"$command\"); failed: $res";
+      syslog 'authpriv|err',"Suggest trying the same command in a shell.";
+    }
+ }
+
+# Option to email a user(s) when a block event occurs.
+# We also fork to send from a child process, incase the sending
+# of mail hangs.
+sub emailonblock {
+   my $user=shift;
+   my $ip=shift;
+   my $event=shift;
+   my $releasetime=shift;
+   my $host = `hostname`;
+   my $name;
+   my @numbers = split(/\./, $ip);
+   my $ip_number = pack("C4", @numbers);
+   ($name) = (gethostbyaddr($ip_number, 2))[0];
+   if( defined $mail ){
+
+      my $shouldmail=$mailaction[0];
+      for(my $i=1;$i<=$#mailaction;$i++) {
+         if( $user =~ /$mailre[$i]/ ) {
+            $shouldmail=$mailaction[$i];
+            last;
+          }
+       }
+
+      if( $shouldmail == 0 ) { return; }
+
+      my $pid=fork;
+      if ( $pid == 0 ) {
+
+         chdir '/'               or die "Can't chdir to /: $!";
+         open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+         open STDOUT, '>/dev/null';
+
+         my $mailcommand;
+         my $mailcomm=sprintf('$mailcommand="%s"',"$mail");
+         if($debug){ syslog 'authpriv|debug',"DB:pre mail command is $mailcomm"; }
+         eval "$mailcomm";
+         if($debug){ syslog 'authpriv|debug',"DB:post mail command is $mailcommand"; }
+         open(MAILPROC,"| $mailcommand") || syslog 'authpriv|warning',"sshdfilter couldn't email block event";
+         if( MAILPROC ){
+            my $ltime=localtime($releasetime);
+            printf MAILPROC "IP $ip ($name) was blocked. $event\n";
+            close( MAILPROC );
+            exit 0;
+         }
+
+      die "cannot fork: $!" unless defined $pid;
+
+      }
+   }
+}
+
+# State tracking hashes
+my %chances;    # number of chances an ip has had. This has a purge time just 
+                # like blocks, so we wont build up a list of stale login attempts.
+my %expiretime;  # indexed on ip, storing a time a block should be removed.
+my %explain;   # hash indexed on ip, storing a reason for the the block event. 
+               # This also flags a block event is active.
+my %pid2ip;  # hash indexed on a pid, mapping to an ip. Supports the dropbear ssh 
+             # server, which gives only the pid as a common element on each line.
+
+my %pidtime; # cache parent pid lookups, to avoid the race condition of looking up
+             # the parent of a process that has just exited. Still doesn't catch all
+             # the scenarios, but, nothing will.
+
+my %ipfwindex;   # IP to ipfw index number
+my %ipfwfree;    # ipfw index numbers that are now free, but aren't part of the continuous set of free numbers
+my $ipfwcur=$ipfwmin;  # lowest free ipfw index of the continous set
+
+#   my $numipfwfree=keys %ipfwfree;
+#   my $numipfwindex=keys %ipfwindex;
+#   my $numexpiretime=keys %expiretime;
+#   printf("1 current=%d of %d (%d-%d), free slots=%d, blocks=%d/%d, action %s, ip=%s\n",$ipfwcur,$ipfwmax-$ipfwcur,$ipfwmin,$ipfwmax,$numipfwfree,$numipfwindex,$numexpiretime,$action,$ip);
+
+sub deldrop {
+   my $ip=shift;  # IP address to remove from drop list
+   if( defined $explain{$ip} ) {
+      my $reason=$explain{$ip};
+      delete $explain{$ip};
+      syslog 'authpriv|notice',"Cancelled $reason block from $ip";
+      my $fwcommand;
+      my $fwcomm=sprintf('$fwcommand="%s"',"$fwcmdpath$firewalldel");
+      if($debug){ syslog 'authpriv|debug',"DB: pre fw del command is $fwcomm"; }
+      if( $ipfwmin==-1 ) {
+         eval "$fwcomm";
+         if($debug){ syslog 'authpriv|debug',"DB: post fw del command is $fwcommand"; }
+         loggingsystem("$fwcommand");
+       } else {
+         my $idx=$ipfwindex{$ip};
+         eval "$fwcomm";
+         if($debug){ syslog 'authpriv|debug',"DB: post fw del command is $fwcommand"; }
+         loggingsystem("$fwcommand");
+         delete $ipfwindex{$ip};
+         delete $expiretime{$ip};
+         $ipfwfree{$idx}=1;
+       }
+      delete $expiretime{$ip};
+      delete $chances{$ip};
+    }
+    
+ }
+
+sub adddrop {
+   my $ip=shift;  # IP address to block
+   my $p_ip = gethostbyname($ip);
+   if(defined $p_ip)
+   {
+   	$ip =inet_ntoa($p_ip);
+	}
+   my $fwcommand;
+   my $fwcomm=sprintf('$fwcommand="%s"',"$fwcmdpath$firewalladd");
+   if($debug){ syslog 'authpriv|debug',"DB: pre fw add command is $fwcomm"; }
+
+   if( $ipfwmin==-1 ) {  # iptables option, simple compared to ipfw and its index numbers.
+      eval "$fwcomm";
+      if($debug){ syslog 'authpriv|debug',"DB: post fw add command is $fwcommand"; }
+      loggingsystem("$fwcommand");
+    } else {
+      my $numipfwfree=keys %ipfwfree;
+      if( $numipfwfree > 0 )  # pick an index from the free pool
+       {
+         my $lowestidx=$ipfwcur;
+         foreach my $idx (keys %ipfwfree) {
+            if( $idx<$lowestidx ) { $lowestidx=$idx; }
+          }
+         delete $ipfwfree{$lowestidx};
+
+         $ipfwindex{$ip}=$lowestidx;
+	 my $idx=$lowestidx;
+         eval "$fwcomm";
+         if($debug>2){ syslog 'authpriv|notice', "DB: recycling ipfw index $lowestidx"; }
+       }
+      else
+       { # pick an index from the continous block, or forced to delete the oldest current block
+         my $idx;
+         if( $ipfwcur<=$ipfwmax )
+          {
+	    $idx=$ipfwcur;
+            $ipfwindex{$ip}=$ipfwcur++;
+            if($debug>2){ syslog 'authpriv|notice', "DB: adding new ipfw index $ipfwindex{$ip}"; }
+          }
+         else
+          {
+	    my $numexpiretime=keys %expiretime;
+	    
+            foreach my $oldip (sort { $expiretime{$a} <=> $expiretime{$b} } keys %expiretime) {
+	       if( $oldip ne $ip ) { # skip small chance of trying to remove self
+                  my $idx=$ipfwindex{$oldip};
+                  if( $debug>2 ){ syslog 'authpriv|notice', "DB: Recycling ip $oldip with index $idx"; }
+                  if(! defined $ipfwindex{$oldip} ){ syslog 'authpriv|err', "Logic error, oldip $oldip not found."; }
+                  deldrop $oldip;
+                  delete $ipfwfree{$idx};
+                  $ipfwindex{$ip}=$idx;
+                  last;
+		}
+             }
+	    $idx=$ipfwindex{$ip};
+            if($debug>2){ syslog 'authpriv|notice', "DB: prematurely recycling oldest ipfw index $ipfwindex{$ip}"; }
+          }
+         eval "$fwcomm";
+       }
+      if($debug){ syslog 'authpriv|debug',"DB: post fw add command is $fwcommand"; }
+      loggingsystem("$fwcommand");
+    }
+ }
+
+# about to enter main loop, so signal parent process to quit. 
+# We never really know if sshd started correctly, so we always exit with a success.
+printf CONSOLEPROC "Exit ok!\n";
+close CONSOLEPROC;
+
+# enable non-blocking read operation
+my $flags = fcntl($SSHDHANDLE, F_GETFL, 0) or die "Can't get flags for the socket: $!\n";
+$flags = fcntl($SSHDHANDLE, F_SETFL, $flags | O_NONBLOCK) or die "Can't set flags for the socket: $!\n";
+
+# buffer input from $SSHDHANDLE, read() may get more than one line, or a partial line
+my $next;
+my $this;
+
+my $shouldexit=0;
+my $purgetime=undef;
+
+sub sig_exit { $shouldexit=1; }
+
+local $SIG{TERM} = 'sig_exit';
+
+
+while( !$shouldexit)
+ {
+   my $rin ='';
+   vec($rin,fileno($SSHDHANDLE),1) = 1;
+   my $ein = $rin ;
+   my $res=select($rin,undef,$ein,$purgetime);
+
+   #printf "Came back with %d\n",$res;
+
+   my $ttime=time;
+
+   # reap any zombies (which are created by sending emails)
+   my $kid;
+   do {
+        $kid = waitpid(-1, WNOHANG);
+    } until $kid <= 0;
+   $purgetime=undef;
+   foreach my $ip (sort { $expiretime{$a} <=> $expiretime{$b} } keys %expiretime) {
+      if( $expiretime{$ip} < $ttime ) {
+         if( defined $explain{$ip} ) {
+            my $reason=$explain{$ip};
+            syslog 'authpriv|notice',"Cancelled $reason block from $ip";
+            deldrop $ip;
+            delete $explain{$ip};
+          }
+         delete $expiretime{$ip};
+         delete $chances{$ip};
+       }
+      elsif( ! defined $purgetime ) {
+         $purgetime=$expiretime{$ip}-$ttime+1;
+         last
+       }
+      else {
+         last;
+       }
+    } # end of iptables purge
+
+   # trim pid cache, for most people this will always be empty
+   foreach my $p (sort { $pidtime{$a} <=> $pidtime{$b} } keys %pidtime) {
+      if( $pidtime{$p} < $ttime ) {
+         delete $pidtime{$p};
+       } elsif( !defined $purgetime || $purgetime>$pidtime{$p}-$ttime ) {
+          $purgetime=$pidtime{$p}-$ttime+1;
+          last;
+       } else {
+          last;
+       }
+    }
+
+   if( $res >0 )
+    {
+      my $firstread=1;
+      while ( 1 )
+       {
+         my $in;
+         my $num=sysread($SSHDHANDLE, $in, 1024);
+         #printf "sysread said $num and $!\n";
+         if( $num==0 && $firstread==1 && $logsource eq "STDIN" )  # detect eof
+          {
+            $shouldexit=1;
+            last;
+          }
+         $firstread=0;
+         if( $num>0 )  # we have input, add it to remains of any previous input and pull out complete lines
+          {
+            #printf "Got >$in<\n";
+            $in="$next$in";
+            while( $in =~ /\n/ )
+             {
+               ($this, $next)=split(/\n/,$in,2);
+               $in=$next;
+
+               chomp $this;
+               $this =~ tr/\n\r//d;   
+               if( $logsource eq "STDIN" ) {
+                  handlesshdoutput($this);
+                } elsif ( $this =~ / $sshdname\[([0-9]+)\]: (.*)/ ) {
+                  my $lpid=$1;
+                  my $fline=$2;
+                  #syslog 'authpriv|notice',"lpid=$lpid, logpid=$logpid, fline=$fline";
+                  if( $logpid<=0 || $lpid==$logpid ) {
+                     handlesshdoutput($fline);
+                   } elsif( $pidtime{$lpid}>$ttime ) {
+                     $pidtime{$lpid}+=720;
+                     #syslog 'authpriv|notice',"Using cache";
+                     handlesshdoutput($fline);
+                   } elsif( open(PPID,"/proc/$lpid/stat") ){ # does 8500 checks/sec on my 2.4.32 P3 660
+                     my $ppid=<PPID>;
+                     close PPID;
+                     chomp $ppid;
+                     $ppid=~ s/^[0-9]+ \($sshdname\) [A-Z] ([0-9]+) .*$/$1/;
+                     #syslog 'authpriv|notice',"ppid=$ppid";
+                     if( $ppid == $logpid ) {
+                        $pidtime{$lpid}=$ttime+720;
+                        handlesshdoutput($fline);
+                      }
+                   }
+                }
+           
+               #printf "ALine is <$this>\n";
+             }
+            #printf "Done processing buffer\n";
+          }
+         elsif( defined $num )  # eof for named pipes
+          {
+            if( $logsource ne "STDIN" )
+             {
+               close $SSHDHANDLE;
+               open($SSHDHANDLE,$logsource) || syslog 'authpriv|err', "Tried to reopen a named pipe $logsource for sshd log messages, but failed";
+               my $flags = fcntl($SSHDHANDLE, F_GETFL, 0) or die "Can't get flags for the socket: $!\n";
+               $flags = fcntl($SSHDHANDLE, F_SETFL, $flags | O_NONBLOCK) or die "Can't set flags for the socket: $!\n";
+               $firstread=1;
+               $next="";
+               last;
+             }
+            else
+             {
+               last;
+             }
+         }
+        else   # num is undefined => ran out of input, not eof
+         {
+           last;
+         }
+       } # end of while(1), sysread() input
+    }
+ } # end of while(!shouldexit)
+
+# find the pattern that matches the given line, and map to an output array
+# Last two parameters are references, notice the odd syntax.
+
+sub matchre_log
+ {
+   my $aline=shift;  # input line
+   my $pats=shift;   # regex match array
+   my $maps=shift;   # map regex matches to specific elements of output
+
+   my @res;
+   for(my $idx=0; $idx<@$pats; $idx++) {
+      #print "comparing to pattern $$pats[$idx]\n";
+      if( $aline =~ /$$pats[$idx]/ ) {
+         #print "pattern was a hit, running $$maps[$idx]\n";
+         eval $$maps[$idx];
+         last;
+       }
+    }
+   return (@res);
+ }
+
+sub isdirty
+ {
+   my $un=shift;
+   my $un2=$un;
+   $un =~ s/$sanitise//g;
+   if( $un ne $un2 ) 
+     { return 1,$un; } 
+   return 0,$un; 
+ }
+
+sub matchre_ip
+ {
+   my $aline=shift; # input line, an ip address
+   my $ips=shift;  # regex match array of IPs
+
+   my $idx=0;
+   for( ; $idx<@$ips; $idx++) {
+      if( $aline =~ /$$ips[$idx]/ ) {
+         return ($idx);
+       }
+    }
+   return ();
+ }
+
+
+sub matchre_user2maxc
+ {
+   my $un=shift; # a user name, which may or may not exist
+   my $ev=shift; # INVALID, DEFAULT or DIRTY
+
+   # DIRTY never looks up names for a match other than $maxc_tags{DIRTY}
+   if( $ev eq "DIRTY" ) {
+      return $maxc_tags{$ev};
+    }
+
+   my $mc=$maxc_tags{$ev};
+
+   for(my $idx=0; $idx<=$#userre; $idx++) {
+      if($debug>2){ syslog 'authpriv|notice', "DB:u2m: un=$un, ev=$ev, idx=$idx, userre=$userre[$idx]"; }
+      if( $userre[$idx] eq $ev ) {
+         if( defined $maxc[$idx] ) { $mc=$maxc[$idx]; }
+       } elsif( $un =~ /$userre[$idx]/ ) {
+         if( defined $maxc[$idx] ) { return $maxc[$idx]; } else { return $mc; }
+       }
+    }
+
+   return $mc;
+ }
+
+sub matchre_user2btime
+ {
+   my $un=shift; # a user name, which may or may not exist
+   my $ev=shift; # INVALID, DEFAULT or DIRTY
+
+   # DIRTY never looks up names for a match other than $btime_tags{DIRTY}
+   if( $ev eq "DIRTY" ) {
+      return $btime_tags{$ev};
+    }
+
+   my $t=$btime_tags{$ev};
+
+   for(my $idx=0; $idx<=$#userre; $idx++) {
+      if( $userre[$idx] eq $ev ) {
+         if( defined $btime[$idx] ) { $t=$btime[$idx]; }
+       } elsif( $un =~ /$userre[$idx]/ ) {
+         if( defined $btime[$idx] ) { return $btime[$idx]; } else { return $t; }
+       }
+    }
+
+   return $t;
+ }
+
+
+# Deal with each complete line of log output from sshd.
+# lots of code duplication, it could be reduced but would probably be even
+# more unreadable. The variations in error messages add a lot of bulk.
+
+sub handlesshdoutput
+ {
+   my $ttime=time;
+
+   for (@_) {
+      my $aline=$_;
+
+      if( $logsource eq "STDIN" ) {  # log sshd output only if we started it.
+          print $SSHDLOGGER "$aline\n";
+          $SSHDLOGGER->autoflush(1);
+       }
+
+      if( $debug>1 ) { syslog 'authpriv|notice',"DB:Aline=$_"; }
+
+      if( my ($user, $ip)=matchre_log($_, \@txt_invalid, \@map_invalid) )
+       {
+         my $ename="INVALID";
+	    
+         if( $ip6toip4 ) { $ip =~ s/^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/\1/; } 
+
+         my @addrs=gethostbyname($ip);
+         @addrs = map { inet_ntoa($_) } @addrs[4 .. $#addrs];
+         for $ip (@addrs) {
+
+            if( my ($idx)=matchre_ip($ip, \@ipre) ) # white/black list
+             {
+               if( $ipaction[$idx]==0 ) { # white list - ignore
+                  syslog 'authpriv|notice',"Illegal username from white listed ip $ip, user $user";
+                } else { # black list - instant block for default time
+                  if( $debug ) { syslog 'authpriv|notice',"DB:INVALID: ip black listed, $ip"; }
+                  $expiretime{$ip}=$ttime+$maxblocktime;
+                  if( ! exists $explain{$ip} ) {
+                     $explain{$ip}="Illegal user name from black listed ip, instant block of $ip";
+                     syslog 'authpriv|notice',$explain{$ip};
+                     emailonblock "INVALID", "$ip", "Illegal user name from black listed ip, instant block.", $expiretime{$ip};
+		     adddrop $ip;
+                   }
+               }
+             } else { # non-exceptional INVALID route
+
+               my ($dirty, $user) = isdirty($user);
+
+               if( $dirty==1 ) { $ename="DIRTY"; $user="DIRTY"; }
+               my $maxc=matchre_user2maxc($user,$ename);
+               my $btime=matchre_user2btime($user,$ename);
+
+               if( $debug ) { syslog 'authpriv|notice',"DB:INVALID: dirty=$dirty user=$user, ip=$ip"; }
+
+               $chances{$ip}++;
+               $expiretime{$ip}=$ttime+$btime;
+
+               if( $chances{$ip} > $maxc ) { # exceeded threshold, see if we need to add a DROP rule
+                  if( ! exists $explain{$ip} ) {
+                     $explain{$ip}="Illegal user name, blocking after $maxc chances";
+                     syslog 'authpriv|notice',"Illegal user name, blocking $ip after $maxc chances";
+                     emailonblock "INVALID", "$ip", "Illegal user name, blocking after $maxc chances.", $ttime+$btime;
+		     adddrop $ip;
+                   }
+                } 
+               else {
+                  syslog 'authpriv|notice',"Chanced illegal user name from $ip, $chances{$ip} guesses out of $maxc";
+                }
+             } # non-black/white list option, standand INVALID or DIRTY
+	  } # name lookup
+       } # End of INVALID
+
+      elsif( my ($ip)=matchre_log($_, \@txt_noid, \@map_noid) )
+       {
+         if( $ip6toip4 ) { $ip =~ s/^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/\1/; } 
+	 
+         my @addrs=gethostbyname($ip);
+         @addrs = map { inet_ntoa($_) } @addrs[4 .. $#addrs];
+         for $ip (@addrs) {
+
+            if( my ($idx)=matchre_ip($ip, \@ipre) ) # white/black list - ignore
+             {
+               if( $ipaction[$idx]== 0 ) { # white list - ignore
+                  syslog 'authpriv|notice',"No ssh id from white listed ip $ip, user $user";
+                } else { # black list - instant block for default time
+                  if( $debug ) { syslog 'authpriv|notice',"DB:NOID: ip black listed, $ip"; }
+                  $expiretime{$ip}=$ttime+$maxblocktime;
+                  if( ! exists $explain{$ip} ) {
+                     $explain{$ip}="No ssh id from black listed ip, instant block of $ip";
+                     syslog 'authpriv|notice',$explain{$ip};
+                     emailonblock "INVALID", "$ip", "No ssh id from black listed ip, instant block.", $expiretime{$ip};
+		     adddrop $ip;
+                   }
+               }
+             } else { # non-exceptional NOID route
+
+               if( $debug ) { syslog 'authpriv|notice',"DB:NOID: ip=$ip"; }
+
+               my $maxc=$maxc_tags{"NOID"};
+               my $btime=$btime_tags{"NOID"};
+
+               $chances{$ip}++;
+               $expiretime{$ip}=$ttime+$btime;
+
+               if( $chances{$ip} > $maxc ) { # exceeded threshold, see if we need to add a DROP rule
+                  if( ! exists $explain{$ip} ) {
+                     $explain{$ip}="No ssh id string from client, blocking after $maxc chances";
+                     syslog 'authpriv|notice',"No ssh id string from client, blocking $ip after $maxc chances";
+                     emailonblock "NOID", "$ip", "No ssh id string from client, blocking after $maxc chances.", $ttime+$btime;
+		     adddrop $ip;
+                   }
+                }
+               else {
+                  syslog 'authpriv|notice',"Chanced missing ssh id string from $ip, $chances{$ip} guesses out of $maxc";
+                }
+             } # non-black/white list option, standand NOID
+	  } # name lookup
+       } # End of NOID
+
+      # Failure from a genuine user
+      elsif( my ($user, $ip)=matchre_log($_, \@txt_failval, \@map_failval) )
+       {
+         if( $ip6toip4 ) { $ip =~ s/^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/\1/; } 
+
+         my @addrs=gethostbyname($ip);
+         @addrs = map { inet_ntoa($_) } @addrs[4 .. $#addrs];
+         for $ip (@addrs) {
+
+            if( my ($idx)=matchre_ip($ip, \@ipre) ) # white/black list - ignore
+             {
+               if( $ipaction[$idx]==0 ) { # white list - ignore
+                  syslog 'authpriv|notice',"Failure from valid user from white listed ip $ip, user $user";
+                } else { # black list - instant block for default time
+                  if( $debug ) { syslog 'authpriv|notice',"DB:FAILVAL: ip black listed user=$user, ip=$ip"; }
+                  $expiretime{$ip}=$ttime+$maxblocktime;
+                  if( ! exists $explain{$ip} ) {
+                     $explain{$ip}="Failure from valid user on a black listed ip, instant block of $ip";
+                     syslog 'authpriv|notice',$explain{$ip};
+                     emailonblock "FAILVAL", "$ip", "Failure from a valid user on a black listed ip, instant block.", $expiretime{$ip};
+		     adddrop $ip;
+                   }
+                }
+             } else { # non-exceptional FAILVAL route
+
+               my $maxc=matchre_user2maxc($user, "DEFAULT");
+               my $btime=matchre_user2btime($user, "DEFAULT");
+
+               if( $debug ) { syslog 'authpriv|notice',"DB:FAILVAL: user=$user, ip=$ip"; }
+
+               $chances{$ip}++;
+               $expiretime{$ip}=$ttime+$btime;
+
+               if( $chances{$ip} > $maxc ) { # exceeded threshold, see if we need to add a DROP rule
+                  if( ! exists $explain{$ip} ) {
+                     $explain{$ip}="Valid user failed, blocking after $maxc chances";
+                     syslog 'authpriv|notice',"Valid user failed, blocking $ip after $maxc chances";
+                     emailonblock "$user", "$ip", "Valid user failed to login, blocking after $maxc chances.", $ttime+$btime;
+		     adddrop $ip;
+                   }
+                } else {
+                  syslog 'authpriv|notice',"Chanced valid user name from $ip, $chances{$ip} guesses out of $maxc";
+                }
+             } # non-black/white list option, standand FAILVAL
+	  } # expand host names
+       } # End of INVALID
+  
+      # a success from an ip means removing it from the list, if it exists
+      elsif( my ($user, $ip)=matchre_log($_, \@txt_accept, \@map_accept) )
+       {
+         if( $ip6toip4 ) { $ip =~ s/^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/\1/; } 
+
+         my @addrs=gethostbyname($ip);
+         @addrs = map { inet_ntoa($_) } @addrs[4 .. $#addrs];
+         for $ip (@addrs) {
+
+            if( $debug ) { syslog 'authpriv|notice',"DB:ACCEPT: user=$user, ip=$ip"; }
+
+            if( defined $explain{$ip} ) { # this would happen if the SSHD chain didn't stop this connection (eg. wrong interface)
+               my $reason=$explain{$ip};
+               syslog 'authpriv|notice',"Valid login, cancelled $reason block from $ip";
+	       deldrop $ip;
+               delete $explain{$ip};
+             }
+            delete $chances{$ip};
+	  } # expand host names
+       }
+
+      # sshd quitting, 'Received signal'... more reliable than waiting for close of pipe
+      elsif( my ($sig)=matchre_log($_, \@txt_quit, \@map_quit) )
+       {
+         if( $debug ) { syslog 'authpriv|notice',"DB:QUIT: signal=$sig"; }
+
+         syslog 'authpriv|notice',"sshd received signal $sig, closing sshdfilter";
+
+         $shouldexit=1;
+         last;
+       }
+
+       # pid to ip mapping, for dropbear.
+      elsif( my ($pid,$ip)=matchre_log($_, \@txt_pid2ip, \@map_pid2ip) )
+       {
+         if( $ip6toip4 ) { $ip =~ s/^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/\1/; } 
+
+         if( $debug ) { syslog 'authpriv|notice',"DB:PID2IP: pid=$pid, ip=$ip"; }
+
+         $pid2ip{$pid}=$ip;
+       }
+
+      # remove pid hash, for dropbear.
+      elsif( my ($pid)=matchre_log($_, \@txt_pidexit, \@map_pidexit) )
+       {
+         if( $debug ) { syslog 'authpriv|notice',"DB:PIDEXIT: pid=$pid, stored ip=$pid2ip{$ip}"; }
+
+         delete $pid2ip{$pid};
+       }
+   
+      # Ignore 'Connection closed' type messages
+
+    } # end of for(), to instanciate $_
+ } # end of handlesshdoutput
+
+if( $logsource eq "STDIN" ){
+   syslog 'authpriv|notice',"sshd quit, closing sshdfilter";
+ } else {
+   syslog 'authpriv|notice',"closing sshdfilter";
+ }
+
+# Reap any zombies (which could be created when sending emails)
+# This might also help with those rare occasions when '/etc/init.d/sshd restart' mysteriously fails.
+my $kid;
+do {
+     $kid = waitpid(-1, WNOHANG);
+ } until $kid <= 0;
+
+close($SSHDHANDLE);
+close $SSHDLOGGER;
+if( defined $pid ){ waitpid($pid,0); }
+
+closelog();
+
+unlink("/var/run/sshdfilter.pid.$chain");
+
+# the end
+exit;
+

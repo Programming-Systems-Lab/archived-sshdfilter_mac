@@ -1,0 +1,32 @@
+#!/bin/bash
+if [ ! -e /var/log/sshd.fifo ]
+then
+	sudo mkfifo /var/log/sshd.fifo
+	sudo chmod 600 /var/log/sshd.fifo
+	sudo echo "auth.info;authpriv.*;remoteauth.crit						/var/log/sshd.fifo" >> /etc/syslog.conf
+	sudo killall syslogd &> /dev/null
+fi
+
+#p=`ps ax | grep -i sshdfilter | grep -v grep | awk '{print $1}'`
+#if [ -n "$p" ]
+#then
+
+#ps ax | grep -i sshdfilter | grep -v grep | awk '{print $1}' | xargs sudo kill
+ps ax | awk '/[s]shdfilter/{print $1}' | xargs sudo kill -9
+
+#fi
+
+l=`launchctl list | grep sshdfilter`
+if [ -n "$l" ]
+then
+	sudo /bin/launchctl unload /Library/LaunchDaemons/net.jonbell.sshdfilter.plist &> /dev/null
+fi
+
+if [ ! -e /etc/firewallrules ]
+then
+	sudo touch /etc/firewallrules
+	sudo chmod 700 /etc/firewallrules
+	sudo echo '#!/bin/sh' > /etc/firewallrules
+fi
+sudo /bin/launchctl load /Library/LaunchDaemons/net.jonbell.sshdfilter.plist &> /dev/null
+exit 0
